@@ -380,12 +380,15 @@ export {
   hasTextBunLockfile,
   validateOutputs,
   warnUnshippableLocalPathSpec,
+  withSourceFileChecker,
   withTypescriptApi,
   workspaceDataDirectory,
   workspaceRootInner,
 } from 'nx/src/devkit-internals';
 export type {
   ApiTypescriptBackend,
+  SourceFileChecker,
+  SourceFileSymbol,
   TsConfigHost,
   TypescriptAst,
 } from 'nx/src/devkit-internals';
