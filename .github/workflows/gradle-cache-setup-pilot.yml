@@ -9,130 +9,32 @@ permissions:
   contents: read
 
 jobs:
-  seed:
+  graph-parity:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+    env:
+      NODE_VERSION: '22.23.4'
+      COREPACK_DEFAULT_TO_LATEST: '0'
+      CI: 'true'
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
 
-      - name: Install the nightly Java toolchains
+      - name: Set up nightly tools
         uses: jdx/mise-action@146a28175021df8ca24f8ee1828cc2a60f980bd5 # v3
         with:
-          install_args: java
           cache: 'false'
 
-      - name: Seed the Gradle dependency cache from the graph
-        shell: bash
+      - name: Install repository dependencies
         run: |
-          set -u
-          uname -sm
-          java -version
-          export GRADLE_USER_HOME
-          GRADLE_USER_HOME=$(mktemp -d "$RUNNER_TEMP/gradle-seed.XXXXXX")
-          start=$(date +%s%3N)
-          timeout -k 15s 5m ./gradlew nxProjectGraph -Phash=gradle-cache-handoff \
-            --no-configuration-cache --parallel --build-cache --warning-mode none \
-            "-PworkspaceRoot=$PWD" --no-daemon --console=plain
-          echo "cold online graph: $(( $(date +%s%3N) - start )) ms" | tee -a "$GITHUB_STEP_SUMMARY"
-          test -s build/nx/nx-root-project.json
-          test -s packages/gradle/project-graph/build/nx/gradle-project-graph.json
-          test -s packages/gradle/batch-runner/build/nx/gradle-batch-runner.json
+          npm install -g npm@11.12.0 --ignore-scripts
+          npm install -g corepack@0.35.0 --ignore-scripts
+          corepack enable
+          corepack prepare --activate
+          pnpm install --frozen-lockfile
+          dotnet restore nx.sln
 
-          transfer="$RUNNER_TEMP/gradle-transfer"
-          mkdir -p "$transfer"
-          start=$(date +%s%3N)
-          tar --zstd --exclude='*.lock' --exclude='*.lck' --exclude=gc.properties \
-            -C "$GRADLE_USER_HOME" -cf "$transfer/dependencies.tar.zst" caches/modules-2
-          tar --zstd --exclude='*.lock' --exclude='*.lck' \
-            -C "$GRADLE_USER_HOME" -cf "$transfer/wrapper.tar.zst" wrapper/dists
-          (
-            cd "$transfer"
-            sha256sum dependencies.tar.zst wrapper.tar.zst > SHA256SUMS
-            wc -c dependencies.tar.zst wrapper.tar.zst | tee -a "$GITHUB_STEP_SUMMARY"
-          )
-          echo "pack cache: $(( $(date +%s%3N) - start )) ms" | tee -a "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload the temporary Gradle handoff
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: gradle-dependency-handoff
-          path: ${{ runner.temp }}/gradle-transfer
-          retention-days: 1
-          compression-level: 0
-          if-no-files-found: error
-
-  e2e:
-    needs: seed
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-        with:
-          persist-credentials: false
-
-      - name: Install the nightly Java toolchains
-        uses: jdx/mise-action@146a28175021df8ca24f8ee1828cc2a60f980bd5 # v3
-        with:
-          install_args: java
-          cache: 'false'
-
-      - name: Download the temporary Gradle handoff
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
-        with:
-          name: gradle-dependency-handoff
-          path: ${{ runner.temp }}/gradle-transfer
-
-      - name: Run the Gradle graph without upstream access
+      - name: Compare online and cache-only Gradle inference
         shell: bash
-        run: |
-          set -u
-          uname -sm
-          java -version
-          transfer="$RUNNER_TEMP/gradle-transfer"
-          (cd "$transfer" && sha256sum --check SHA256SUMS)
-          cold_home=$(mktemp -d "$RUNNER_TEMP/gradle-wrapper-only.XXXXXX")
-          warmed_home=$(mktemp -d "$RUNNER_TEMP/gradle-restored.XXXXXX")
-          start=$(date +%s%3N)
-          tar --zstd -xf "$transfer/wrapper.tar.zst" -C "$warmed_home"
-          tar --zstd -xf "$transfer/dependencies.tar.zst" -C "$warmed_home"
-          echo "unpack cache: $(( $(date +%s%3N) - start )) ms" | tee -a "$GITHUB_STEP_SUMMARY"
-          cp -a "$warmed_home/wrapper" "$cold_home/"
-          git worktree add -q --detach "$RUNNER_TEMP/gradle-cold-control" HEAD
-
-          graph_with_no_network() {
-            local workdir="$1" cache_home="$2"
-            shift 2
-            (
-              cd "$workdir"
-              sudo -n unshare --net --fork --kill-child=TERM bash -c '
-                set -eu
-                ip link set lo up
-                test -z "$(ip -4 route show default)"
-                test -z "$(ip -6 route show default)"
-                exec "$@"
-              ' bash runuser -u "$USER" -- env CI=true JAVA_HOME="$JAVA_HOME" \
-                JAVA17_HOME="$JAVA17_HOME" GRADLE_USER_HOME="$cache_home" \
-                timeout -k 15s 5m ./gradlew nxProjectGraph -Phash=gradle-cache-handoff \
-                --no-configuration-cache --parallel --build-cache --warning-mode none \
-                "-PworkspaceRoot=$PWD" --no-daemon --console=plain "$@"
-            )
-          }
-
-          if graph_with_no_network "$RUNNER_TEMP/gradle-cold-control" "$cold_home" --offline >"$RUNNER_TEMP/cold.log" 2>&1; then
-            echo "The wrapper-only control unexpectedly succeeded."
-            exit 1
-          fi
-          grep -E 'No cached version.*offline mode|Plugin .* was not found' "$RUNNER_TEMP/cold.log" || {
-            cat "$RUNNER_TEMP/cold.log"
-            exit 1
-          }
-
-          start=$(date +%s%3N)
-          graph_with_no_network "$PWD" "$warmed_home"
-          test -s build/nx/nx-root-project.json
-          test -s packages/gradle/project-graph/build/nx/gradle-project-graph.json
-          test -s packages/gradle/batch-runner/build/nx/gradle-batch-runner.json
-          echo "restored graph with network disabled: $(( $(date +%s%3N) - start )) ms, all three reports present" |
-            tee -a "$GITHUB_STEP_SUMMARY"
+        run: bash .github/workflows/nightly/gradle-cache-graph-pilot.sh
