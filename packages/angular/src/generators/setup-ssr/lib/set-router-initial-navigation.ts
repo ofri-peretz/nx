@@ -5,26 +5,22 @@ import {
 } from '@nx/devkit';
 import { insertImport } from '@nx/js';
 import {
-  ensureTypescript,
   ast,
+  ensureTypescript,
+  printNodeUpdate,
   query,
   type TypescriptAst,
 } from '@nx/devkit/internal';
 import type {
   CallExpression,
   ImportSpecifier,
-  Node,
+  ObjectLiteralElementLike,
+  ObjectLiteralExpression,
   SourceFile,
 } from 'typescript';
-import {
-  FileChangeRecorder,
-  spliceListElements,
-} from '../../../utils/file-change-recorder';
 import type { NormalizedGeneratorOptions } from '../schema';
 
 let ts: TypescriptAst;
-
-const INITIAL_NAVIGATION_PROPERTY = `initialNavigation: 'enabledBlocking'`;
 
 export function setRouterInitialNavigation(
   tree: Tree,
@@ -58,24 +54,31 @@ function processFileWithStandaloneSetup(tree: Tree, filePath: string) {
   }
 
   if (
-    provideRouterCallExpression.arguments.some((arg) =>
-      isCallTo(arg, 'withEnabledBlockingInitialNavigation')
+    provideRouterCallExpression.arguments.some(
+      (arg) =>
+        ts.isCallExpression(arg) &&
+        ts.isIdentifier(arg.expression) &&
+        arg.expression.text === 'withEnabledBlockingInitialNavigation'
     )
   ) {
     return;
   }
 
-  const recorder = new FileChangeRecorder(tree, filePath);
-  spliceListElements(
-    recorder,
-    provideRouterCallExpression.arguments,
-    provideRouterCallExpression.getEnd() - 1,
-    (arg) => isCallTo(arg, 'withDisabledInitialNavigation'),
-    'withEnabledBlockingInitialNavigation()'
+  const updatedProvideRouterCallExpression = printNodeUpdate(
+    provideRouterCallExpression,
+    updateProvideRouterCallExpression(provideRouterCallExpression)
   );
-  recorder.applyChanges();
 
-  sourceFile = ast(recorder.content);
+  content = `${content.slice(
+    0,
+    provideRouterCallExpression.getStart()
+  )}${updatedProvideRouterCallExpression}${content.slice(
+    provideRouterCallExpression.getEnd()
+  )}`;
+
+  tree.write(filePath, content);
+
+  sourceFile = ast(content);
   sourceFile = insertImport(
     tree,
     sourceFile,
@@ -108,8 +111,35 @@ function processFileWithStandaloneSetup(tree: Tree, filePath: string) {
   );
 }
 
+function updateProvideRouterCallExpression(
+  node: CallExpression
+): CallExpression {
+  const filteredArgs = node.arguments.filter(
+    (arg) =>
+      !(
+        ts.isCallExpression(arg) &&
+        ts.isIdentifier(arg.expression) &&
+        arg.expression.text === 'withDisabledInitialNavigation'
+      )
+  );
+
+  const initialNavigationFeatureArg = ts.factory.createCallExpression(
+    ts.factory.createIdentifier('withEnabledBlockingInitialNavigation'),
+    [],
+    []
+  );
+
+  return ts.factory.updateCallExpression(
+    node,
+    node.expression,
+    node.typeArguments,
+    [...filteredArgs, initialNavigationFeatureArg]
+  );
+}
+
 function processFileWithNgModuleSetup(tree: Tree, filePath: string) {
-  const sourceFile = ast(tree.read(filePath, 'utf-8'));
+  const content = tree.read(filePath, 'utf-8');
+  const sourceFile = ast(content);
 
   const routerModuleForRootCallExpression =
     getRouterModuleForRootCallExpression(sourceFile);
@@ -117,35 +147,69 @@ function processFileWithNgModuleSetup(tree: Tree, filePath: string) {
     return;
   }
 
-  const recorder = new FileChangeRecorder(tree, filePath);
-  const [routes, routerOptions] = routerModuleForRootCallExpression.arguments;
-  if (!routerOptions) {
-    recorder.insertLeft(
-      routes.getEnd(),
-      `, { ${INITIAL_NAVIGATION_PROPERTY} }`
-    );
-  } else if (ts.isObjectLiteralExpression(routerOptions)) {
-    spliceListElements(
-      recorder,
-      routerOptions.properties,
-      routerOptions.getEnd() - 1,
-      (property) =>
-        ts.isPropertyAssignment(property) &&
-        ts.isIdentifier(property.name) &&
-        property.name.text === 'initialNavigation',
-      INITIAL_NAVIGATION_PROPERTY
-    );
-  } else {
-    recorder.replace(routerOptions, `{ ${INITIAL_NAVIGATION_PROPERTY} }`);
-  }
-  recorder.applyChanges();
+  const updatedRouterModuleForRootCallExpression = printNodeUpdate(
+    routerModuleForRootCallExpression,
+    updateRouterModuleForRootCallExpression(routerModuleForRootCallExpression)
+  );
+
+  tree.write(
+    filePath,
+    `${content.slice(
+      0,
+      routerModuleForRootCallExpression.getStart()
+    )}${updatedRouterModuleForRootCallExpression}${content.slice(
+      routerModuleForRootCallExpression.getEnd()
+    )}`
+  );
 }
 
-function isCallTo(node: Node, name: string): boolean {
-  return (
-    ts.isCallExpression(node) &&
-    ts.isIdentifier(node.expression) &&
-    node.expression.text === name
+function updateRouterModuleForRootCallExpression(
+  node: CallExpression
+): CallExpression {
+  const existingOptions = node.arguments[1] as
+    | ObjectLiteralExpression
+    | undefined;
+
+  const existingProperties = existingOptions?.properties
+    ? ts.factory.createNodeArray(
+        existingOptions.properties.filter(
+          (exp) =>
+            !(
+              ts.isPropertyAssignment(exp) &&
+              ts.isIdentifier(exp.name) &&
+              exp.name.text === 'initialNavigation'
+            )
+        )
+      )
+    : ts.factory.createNodeArray<ObjectLiteralElementLike>();
+
+  const enabledLiteral = ts.factory.createStringLiteral(
+    'enabledBlocking',
+    true
+  );
+  const initialNavigationProperty = ts.factory.createPropertyAssignment(
+    'initialNavigation',
+    enabledLiteral
+  );
+
+  const routerOptions = existingOptions
+    ? ts.factory.updateObjectLiteralExpression(
+        existingOptions,
+        ts.factory.createNodeArray([
+          ...existingProperties,
+          initialNavigationProperty,
+        ])
+      )
+    : ts.factory.createObjectLiteralExpression(
+        ts.factory.createNodeArray([initialNavigationProperty])
+      );
+  const args = [node.arguments[0], routerOptions];
+
+  return ts.factory.updateCallExpression(
+    node,
+    node.expression,
+    node.typeArguments,
+    args
   );
 }
 
