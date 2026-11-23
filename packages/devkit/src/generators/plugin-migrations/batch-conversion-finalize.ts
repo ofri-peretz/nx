@@ -2,7 +2,6 @@ import { join } from 'node:path/posix';
 import {
   getProjects,
   readJson,
-  readNxJson,
   serializeJson,
   updateNxJson,
   writeJson,
@@ -51,6 +50,7 @@ import {
   unverifiedPairsWarning,
   verificationErrorsWarning,
 } from './conversion-warnings';
+import { readRequiredNxJson } from './plugin-migration-utils';
 
 type Logger = typeof devkitLogger;
 
@@ -127,7 +127,7 @@ async function runFinalize(
     return;
   }
 
-  const nxJson = readNxJson(tree);
+  const nxJson = readRequiredNxJson(tree);
   const finalPlugins = nxJson.plugins ?? [];
 
   // Classify every final registration: a registration of a plan's plugin is
@@ -196,7 +196,7 @@ async function runFinalize(
     // and the combined verification see them.
     proposedNxJson.targetDefaults ??= {};
     for (const targetName of [...state.targets.keys()].sort()) {
-      const targetPlan = state.targets.get(targetName);
+      const targetPlan = getTargetPlan(state, targetName);
       if (Object.keys(targetPlan.common).length === 0) {
         continue;
       }
@@ -219,6 +219,9 @@ async function runFinalize(
       return;
     }
     const plan = plans.find((p) => p.pluginPath === pluginPath);
+    if (!plan) {
+      return;
+    }
     specifiedPlugins.push(
       new LoadedNxPlugin(
         {
@@ -288,29 +291,41 @@ async function runFinalize(
  * children in the batch may have edited package.json files after this plan was
  * staged.
  */
+function getTargetPlan(state: PlanState, targetName: string): TargetPlan {
+  const targetPlan = state.targets.get(targetName);
+  if (!targetPlan) {
+    throw new Error(`Could not find the plan for target "${targetName}".`);
+  }
+  return targetPlan;
+}
+
 function planTargets(tree: Tree, state: PlanState): void {
   const { plan } = state;
   for (const [projectName, targetMap] of plan.residualByProject) {
     const root = plan.rootByProject.get(projectName);
+    if (root === undefined) {
+      throw new Error(`Could not find the root of project "${projectName}".`);
+    }
     for (const [targetName, entry] of targetMap) {
-      if (!state.targets.has(targetName)) {
-        state.targets.set(targetName, {
+      let targetPlan = state.targets.get(targetName);
+      if (!targetPlan) {
+        targetPlan = {
           pairs: [],
           excludedProjects: new Set(),
           migratedRoots: new Set(),
           common: {},
           hoistedEntry: undefined,
           rejected: false,
-        });
+        };
+        state.targets.set(targetName, targetPlan);
       }
-      const targetPlan = state.targets.get(targetName);
       targetPlan.pairs.push({ projectName, root, entry });
       targetPlan.migratedRoots.add(root);
     }
   }
 
   for (const targetName of [...state.targets.keys()].sort()) {
-    const targetPlan = state.targets.get(targetName);
+    const targetPlan = getTargetPlan(state, targetName);
     const eligibleResiduals: TargetConfiguration[] = [];
     for (const pair of targetPlan.pairs) {
       const packageJsonAuthored = packageJsonAuthorsTargetIdentity(
@@ -409,7 +424,7 @@ function applyPlanGates(
   const { plan } = state;
   const retainResiduals = (targetNames: string[], reason: string) => {
     for (const targetName of targetNames) {
-      state.targets.get(targetName).common = {};
+      getTargetPlan(state, targetName).common = {};
     }
     state.log.warn(retainedResidualsWarning(targetNames, reason));
   };
@@ -448,7 +463,7 @@ function applyPlanGates(
       nonExactNameTargets.push(targetName);
       continue;
     }
-    const targetPlan = state.targets.get(targetName);
+    const targetPlan = getTargetPlan(state, targetName);
     const eligiblePairs = targetPlan.pairs
       .filter((pair) => !targetPlan.excludedProjects.has(pair.projectName))
       .map((pair) => ({
@@ -697,15 +712,12 @@ function verifyPairs(
       }
 
       if (hoisted) {
-        if (!deviationsByProject.has(pair.projectName)) {
-          deviationsByProject.set(pair.projectName, {
-            root: pair.root,
-            targets: new Map(),
-          });
+        let deviations = deviationsByProject.get(pair.projectName);
+        if (!deviations) {
+          deviations = { root: pair.root, targets: new Map() };
+          deviationsByProject.set(pair.projectName, deviations);
         }
-        deviationsByProject
-          .get(pair.projectName)
-          .targets.set(targetName, plannedWrite);
+        deviations.targets.set(targetName, plannedWrite);
       }
     }
   }
@@ -800,10 +812,9 @@ function planDeadExecutorCleanup(
   const statesByExecutor = new Map<string, PlanState[]>();
   for (const state of planStates) {
     for (const executor of state.plan.migratedExecutors) {
-      if (!statesByExecutor.has(executor)) {
-        statesByExecutor.set(executor, []);
-      }
-      statesByExecutor.get(executor).push(state);
+      const executorStates = statesByExecutor.get(executor) ?? [];
+      statesByExecutor.set(executor, executorStates);
+      executorStates.push(state);
     }
   }
   for (const [executor, states] of statesByExecutor) {
@@ -930,7 +941,7 @@ function applyWriteSet(
     let restoreNote: string;
     try {
       for (const snapshot of snapshots) {
-        if (snapshot.exists) {
+        if (snapshot.content !== null) {
           tree.write(snapshot.path, snapshot.content);
           if (snapshot.options?.mode !== undefined) {
             // Restoring bytes identical to disk removes the recorded change
@@ -947,7 +958,7 @@ function applyWriteSet(
       const unrestored = snapshots.filter(
         (snapshot) =>
           tree.exists(snapshot.path) !== snapshot.exists ||
-          (snapshot.exists &&
+          (snapshot.content !== null &&
             !tree.read(snapshot.path)?.equals(snapshot.content)) ||
           restoredChangeByPath.get(snapshot.path)?.options?.mode !==
             snapshot.options?.mode

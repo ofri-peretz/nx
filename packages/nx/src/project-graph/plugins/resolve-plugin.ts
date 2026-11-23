@@ -34,9 +34,9 @@ type LocalPluginMatch = {
 
 const TS_SOURCE_EXTENSIONS = new Set(['.ts', '.tsx', '.cts', '.mts']);
 
-let projectsWithoutInference: Record<string, ProjectConfiguration>;
+let projectsWithoutInference: Record<string, ProjectConfiguration> | undefined;
 let projectsWithoutInferencePromise: Promise<
-  typeof projectsWithoutInference
+  Record<string, ProjectConfiguration>
 > | null = null;
 
 export async function resolveNxPlugin(
@@ -106,15 +106,17 @@ function readPluginMainFromProjectConfiguration(
   plugin: ProjectConfiguration
 ): string | null {
   const { main } =
-    Object.values(plugin.targets).find((x) =>
-      [
-        '@nx/js:tsc',
-        '@nrwl/js:tsc',
-        '@nx/js:swc',
-        '@nrwl/js:swc',
-        '@nx/node:package',
-        '@nrwl/node:package',
-      ].includes(x.executor)
+    Object.values(plugin.targets ?? {}).find(
+      (x) =>
+        x.executor !== undefined &&
+        [
+          '@nx/js:tsc',
+          '@nrwl/js:tsc',
+          '@nx/js:swc',
+          '@nrwl/js:swc',
+          '@nx/node:package',
+          '@nrwl/node:package',
+        ].includes(x.executor)
     )?.options ||
     plugin.targets?.build?.options ||
     {};
@@ -132,10 +134,10 @@ export function resolveLocalNxPlugin(
 export function getPluginPathAndName(
   moduleName: string,
   paths: string[],
-  projects: Record<string, ProjectConfiguration>,
+  projects: Record<string, ProjectConfiguration> | undefined,
   root: string
 ) {
-  let pluginPath: string | undefined;
+  let pluginPath: string | null | undefined;
 
   // Resolve local workspace plugins from source first so the workspace's
   // `customConditions`/`development` exports condition wins over the built
@@ -160,7 +162,14 @@ export function getPluginPathAndName(
       if (localPlugin && isPackageResolutionError(e)) {
         throwUnresolvableLocalPluginError(moduleName, localPlugin, root);
       }
-      if (e.code !== 'MODULE_NOT_FOUND') {
+      if (
+        !(
+          typeof e === 'object' &&
+          e !== null &&
+          'code' in e &&
+          e.code === 'MODULE_NOT_FOUND'
+        )
+      ) {
         throw e;
       }
       if (localPlugin) {
@@ -311,8 +320,12 @@ function lookupLocalPlugin(
   };
 }
 
-let packageEntryPointsToProjectMap: Record<string, ProjectConfiguration>;
-let wildcardEntryPointsToProjectMap: Record<string, ProjectConfiguration>;
+let packageEntryPointsToProjectMap:
+  | Record<string, ProjectConfiguration>
+  | undefined;
+let wildcardEntryPointsToProjectMap:
+  | Record<string, ProjectConfiguration>
+  | undefined;
 function findNxProjectForImportPath(
   importPath: string,
   projects: Record<string, ProjectConfiguration>,
@@ -329,6 +342,7 @@ function findNxProjectForImportPath(
     const projectNameMap = new Map<string, ProjectConfiguration>();
     for (const projectRoot in projects) {
       const project = projects[projectRoot];
+      if (project.name === undefined) continue;
       projectRootMappings.set(project.root, project.name);
       projectNameMap.set(project.name, project);
     }
@@ -343,7 +357,7 @@ function findNxProjectForImportPath(
     }
   }
 
-  if (!packageEntryPointsToProjectMap && !wildcardEntryPointsToProjectMap) {
+  if (!packageEntryPointsToProjectMap || !wildcardEntryPointsToProjectMap) {
     ({
       entryPointsToProjectMap: packageEntryPointsToProjectMap,
       wildcardEntryPointsToProjectMap,
@@ -369,7 +383,7 @@ function findNxProjectForImportPath(
   return null;
 }
 
-let tsconfigPaths: Record<string, string[]>;
+let tsconfigPaths: Record<string, string[]> | undefined;
 
 function readTsConfigPaths(root: string = workspaceRoot) {
   if (!tsconfigPaths) {

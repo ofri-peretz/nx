@@ -7,7 +7,6 @@ import type {
 } from 'nx/src/config/workspace-json-project-json';
 import {
   readJson,
-  readNxJson,
   readProjectConfiguration,
   getProjects,
   updateNxJson,
@@ -64,7 +63,10 @@ import {
   unverifiedPairsWarning,
   verificationErrorsWarning,
 } from './conversion-warnings';
-import { deleteMatchingProperties } from './plugin-migration-utils';
+import {
+  deleteMatchingProperties,
+  readRequiredNxJson,
+} from './plugin-migration-utils';
 
 export type InferredTargetConfiguration = TargetConfiguration & {
   name: string;
@@ -279,7 +281,7 @@ export function collectMigrationScope<T>(
           );
           if (takenOption && !migration.allowSharedOptionOverwrite) {
             log.warn(
-              `The ${targetName} target on project "${projectName}" cannot be migrated. The "${takenOption}" plugin option is already set to ${JSON.stringify(existing[takenOption])} by another target of the project, and the plugin can only infer one target per option. The target keeps its current configuration; rerun the migration once the other target is inferred to convert it.`
+              `The ${targetName} target on project "${projectName}" cannot be migrated. The "${takenOption.option}" plugin option is already set to ${JSON.stringify(takenOption.current)} by another target of the project, and the plugin can only infer one target per option. The target keeps its current configuration; rerun the migration once the other target is inferred to convert it.`
             );
             return;
           }
@@ -288,34 +290,33 @@ export function collectMigrationScope<T>(
             mergePluginOptions(existing, inferenceOptions)
           );
 
-          if (!targetAndProjects.has(targetName)) {
-            targetAndProjects.set(targetName, new Set());
-            inferenceOptionsByTarget.set(targetName, new Map());
-          }
-          targetAndProjects.get(targetName).add(projectName);
-          inferenceOptionsByTarget
-            .get(targetName)
-            .set(projectName, inferenceOptions);
+          const targetProjects =
+            targetAndProjects.get(targetName) ?? new Set<string>();
+          const targetInferenceOptions =
+            inferenceOptionsByTarget.get(targetName) ??
+            new Map<string, Partial<T>>();
+          targetAndProjects.set(targetName, targetProjects);
+          inferenceOptionsByTarget.set(targetName, targetInferenceOptions);
+          targetProjects.add(projectName);
+          targetInferenceOptions.set(projectName, inferenceOptions);
         }
       );
 
-      for (const [targetName, projs] of targetAndProjects) {
+      for (const [targetName, optionsByProject] of inferenceOptionsByTarget) {
         const optionSetIdsByProject = new Map<string, number>();
         inferenceOptionSetIds.set(targetName, optionSetIdsByProject);
-        for (const project of projs) {
-          const inferenceOptions = inferenceOptionsByTarget
-            .get(targetName)
-            .get(project);
+        for (const [project, inferenceOptions] of optionsByProject) {
           const key = stableStringify(inferenceOptions);
-          if (!optionSetGroupsByKey.has(key)) {
-            optionSetGroupsByKey.set(key, {
+          let optionSetGroup = optionSetGroupsByKey.get(key);
+          if (!optionSetGroup) {
+            optionSetGroup = {
               id: optionSetGroupsByKey.size,
               options: inferenceOptions,
               targetNames: new Set(),
               migratedRoots: new Set(),
-            });
+            };
+            optionSetGroupsByKey.set(key, optionSetGroup);
           }
-          const optionSetGroup = optionSetGroupsByKey.get(key);
           optionSetGroup.targetNames.add(targetName);
           optionSetIdsByProject.set(project, optionSetGroup.id);
           optionSetGroup.migratedRoots.add(
@@ -475,13 +476,17 @@ export async function computeResidualByProject<T>(
           projectConfigsByName,
           projectName
         );
-        const preMigrationTarget = structuredClone(
-          projectConfig.targets[targetName]
-        );
+        const projectTargetConfig = projectConfig.targets?.[targetName];
+        if (!projectTargetConfig) {
+          throw new Error(
+            `Could not find the "${targetName}" target of project "${projectName}".`
+          );
+        }
+        const preMigrationTarget = structuredClone(projectTargetConfig);
         // Later steps mutate the merged target, which may retain nested
         // references from either input
         let projectTarget = mergeTargetConfigurations(
-          structuredClone(projectConfig.targets[targetName]),
+          structuredClone(projectTargetConfig),
           structuredClone(targetDefaultsForExecutor)
         );
         delete projectTarget.executor;
@@ -512,12 +517,16 @@ export async function computeResidualByProject<T>(
           structuredClone(fullInferredTarget)
         );
 
-        if (!residualByProject.has(projectName)) {
-          residualByProject.set(projectName, new Map());
+        let projectResiduals = residualByProject.get(projectName);
+        if (!projectResiduals) {
+          projectResiduals = new Map();
+          residualByProject.set(projectName, projectResiduals);
         }
-        residualByProject
-          .get(projectName)
-          .set(targetName, { residual, baselineFinal, preMigrationTarget });
+        projectResiduals.set(targetName, {
+          residual,
+          baselineFinal,
+          preMigrationTarget,
+        });
       }
     }
   }
@@ -573,11 +582,8 @@ function writeResidualTarget(
   residual: TargetConfiguration,
   logger?: typeof devkitLogger
 ): boolean {
-  const projectConfig = readCachedProjectConfiguration(
-    tree,
-    projectConfigsByName,
-    projectName
-  );
+  const projectConfig: ProjectConfiguration & { '// targets'?: string } =
+    readCachedProjectConfiguration(tree, projectConfigsByName, projectName);
 
   const identitySource = packageJsonAuthorsTargetIdentity(
     tree,
@@ -591,10 +597,14 @@ function writeResidualTarget(
     return false;
   }
 
+  const targets = projectConfig.targets;
+  if (!targets) {
+    throw new Error(`Project "${projectName}" has no targets.`);
+  }
   if (Object.keys(residual).length > 0) {
-    projectConfig.targets[targetName] = residual;
+    targets[targetName] = residual;
   } else {
-    delete projectConfig.targets[targetName];
+    delete targets[targetName];
   }
 
   if (!projectConfig['// targets']) {
@@ -659,21 +669,28 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 function findConflictingPluginOption<T>(
   existing: T | undefined,
   next: Partial<T>
-): string | undefined {
-  return Object.keys(next).find((option) => {
-    const current = existing?.[option];
-    const value = next[option];
+): { option: string; current: unknown } | undefined {
+  const existingOptions: Record<string, unknown> = isPlainObject(existing)
+    ? existing
+    : {};
+  for (const [option, value] of Object.entries(next)) {
+    const current = existingOptions[option];
     if (current === undefined) {
-      return false;
+      continue;
     }
-    if (isPlainObject(current) && isPlainObject(value)) {
-      return Object.keys(value).some(
-        (key) =>
-          current[key] !== undefined && !isDeepEqual(current[key], value[key])
-      );
+    const conflicts =
+      isPlainObject(current) && isPlainObject(value)
+        ? Object.keys(value).some(
+            (key) =>
+              current[key] !== undefined &&
+              !isDeepEqual(current[key], value[key])
+          )
+        : !isDeepEqual(current, value);
+    if (conflicts) {
+      return { option, current };
     }
-    return !isDeepEqual(current, value);
-  });
+  }
+  return undefined;
 }
 
 function mergePluginOptions<T>(existing: T | undefined, next: Partial<T>): T {
@@ -848,8 +865,9 @@ export function removeHoistedTargetDefault(
   targetName: string,
   entry: TargetDefaultArrayEntry
 ): void {
-  const value = nxJson.targetDefaults?.[targetName];
-  if (!Array.isArray(value)) {
+  const targetDefaults = nxJson.targetDefaults;
+  const value = targetDefaults?.[targetName];
+  if (!targetDefaults || !Array.isArray(value)) {
     return;
   }
   const entryKey = stableStringify(entry);
@@ -861,12 +879,12 @@ export function removeHoistedTargetDefault(
     }
   }
   if (remaining.length === 0) {
-    delete nxJson.targetDefaults[targetName];
+    delete targetDefaults[targetName];
   } else if (remaining.length === 1 && remaining[0].filter === undefined) {
     const { filter: _filter, ...config } = remaining[0];
-    nxJson.targetDefaults[targetName] = config;
+    targetDefaults[targetName] = config;
   } else {
-    nxJson.targetDefaults[targetName] = remaining;
+    targetDefaults[targetName] = remaining;
   }
 }
 
@@ -997,7 +1015,12 @@ function computeInferredExecutorByPair<T>(
       for (const projectName of projectNames) {
         const optionSetId = executorScope.inferenceOptionSetIds
           .get(targetName)
-          .get(projectName);
+          ?.get(projectName);
+        if (optionSetId === undefined) {
+          throw new Error(
+            `Could not find an inference option set for target "${targetName}".`
+          );
+        }
         const root = projectGraph.nodes[projectName]?.data.root;
         const inferredTarget = getFullInferredTarget(
           inferredTargetsByOptionSet,
@@ -1170,12 +1193,12 @@ function hoistCommonAndWrite<T>(
   const projectsByTarget = new Map<string, string[]>();
   for (const [projectName, targetMap] of residualByProject) {
     for (const [targetName, entry] of targetMap) {
-      if (!residualsByTarget.has(targetName)) {
-        residualsByTarget.set(targetName, []);
-        projectsByTarget.set(targetName, []);
-      }
-      residualsByTarget.get(targetName).push(entry.residual);
-      projectsByTarget.get(targetName).push(projectName);
+      const targetResiduals = residualsByTarget.get(targetName) ?? [];
+      const targetProjects = projectsByTarget.get(targetName) ?? [];
+      residualsByTarget.set(targetName, targetResiduals);
+      projectsByTarget.set(targetName, targetProjects);
+      targetResiduals.push(entry.residual);
+      targetProjects.push(projectName);
     }
   }
 
@@ -1193,7 +1216,7 @@ function hoistCommonAndWrite<T>(
   let packageJsonAuthoredIdentity = false;
   // Deterministic target-name order for stable nx.json output.
   for (const targetName of [...residualsByTarget.keys()].sort()) {
-    const residuals = residualsByTarget.get(targetName);
+    const residuals = residualsByTarget.get(targetName) ?? [];
     const projects = projectsByTarget.get(targetName) ?? [];
     // Partition the target's projects. A target's identity is authored in a
     // default layer when either:
@@ -1269,7 +1292,7 @@ function hoistCommonAndWrite<T>(
   // this tail check would pass on a plugins array that is not final; such
   // invocations never reach this hoist, since a batch child defers
   // centralization entirely to the finalize pass (see BatchConversionSession).
-  if (!pluginRegistrationsFormTail(readNxJson(tree), pluginPath)) {
+  if (!pluginRegistrationsFormTail(readRequiredNxJson(tree), pluginPath)) {
     const skippedTargets = centralizableTargets();
     if (skippedTargets.length > 0) {
       retainResiduals(
@@ -1286,7 +1309,7 @@ function hoistCommonAndWrite<T>(
   // residuals. In-memory only, no inference or graph pass.
   const preflightTargets = centralizableTargets();
   if (preflightTargets.length > 0) {
-    const currentTargetDefaults = readNxJson(tree).targetDefaults;
+    const currentTargetDefaults = readRequiredNxJson(tree).targetDefaults;
     // The pair's effective executor decides whether an executor-keyed default
     // outranks the appended exact key.
     const inferredExecutorByPair = computeInferredExecutorByPair(
@@ -1316,6 +1339,10 @@ function hoistCommonAndWrite<T>(
         nonExactNameTargets.push(targetName);
         continue;
       }
+      const common = commonByTarget.get(targetName);
+      if (!common) {
+        continue;
+      }
       const excludedProjects =
         excludedProjectsByTarget.get(targetName) ?? new Set<string>();
       const eligiblePairs = (projectsByTarget.get(targetName) ?? [])
@@ -1330,7 +1357,7 @@ function hoistCommonAndWrite<T>(
         hoistChangesExistingTargetDefaults(
           currentTargetDefaults,
           targetName,
-          commonByTarget.get(targetName),
+          common,
           pluginPath,
           eligiblePairs,
           projectGraph.nodes
@@ -1384,13 +1411,13 @@ function hoistCommonAndWrite<T>(
   }
 
   // Update nx.json targetDefaults: hoist commons, drop dead executor entries.
-  const nxJson = readNxJson(tree);
+  const nxJson = readRequiredNxJson(tree);
   nxJson.targetDefaults ??= {};
 
   const hoistedByTarget = new Map<string, TargetDefaultArrayEntry>();
   for (const targetName of [...commonByTarget.keys()].sort()) {
     const common = commonByTarget.get(targetName);
-    if (Object.keys(common).length === 0) {
+    if (!common || Object.keys(common).length === 0) {
       continue;
     }
     hoistedByTarget.set(
@@ -1475,8 +1502,13 @@ function mergeInputs(
   target: TargetConfiguration,
   inferredTarget: TargetConfiguration
 ) {
+  const targetInputs = target.inputs;
+  const inferredInputs = inferredTarget.inputs;
+  if (!targetInputs || !inferredInputs) {
+    return;
+  }
   const isInputInferred = (input: string | InputDefinition) => {
-    return inferredTarget.inputs.some((inferredInput) => {
+    return inferredInputs.some((inferredInput) => {
       try {
         deepStrictEqual(input, inferredInput);
         return true;
@@ -1486,12 +1518,12 @@ function mergeInputs(
     });
   };
 
-  if (target.inputs.every(isInputInferred)) {
+  if (targetInputs.every(isInputInferred)) {
     delete target.inputs;
     return;
   }
 
-  const inferredTargetExternalDependencyInput = inferredTarget.inputs.find(
+  const inferredTargetExternalDependencyInput = inferredInputs.find(
     (i): i is { externalDependencies: string[] } =>
       typeof i !== 'string' && 'externalDependencies' in i
   );
@@ -1501,14 +1533,14 @@ function mergeInputs(
     return;
   }
 
-  const targetExternalDependencyInput = target.inputs.find(
+  const targetExternalDependencyInput = targetInputs.find(
     (i): i is { externalDependencies: string[] } =>
       typeof i !== 'string' && 'externalDependencies' in i
   );
   if (!targetExternalDependencyInput) {
     // the target doesn't have an externalDependencies input, so we can just
     // add the inferred one
-    target.inputs.push(inferredTargetExternalDependencyInput);
+    targetInputs.push(inferredTargetExternalDependencyInput);
   } else {
     // the target has an externalDependencies input, so we need to merge them
     targetExternalDependencyInput.externalDependencies = Array.from(
@@ -1656,8 +1688,8 @@ export async function inferOncePerOptionSet<T>(
         tree,
         { plugin: pluginPath, options: group.options },
         pluginPath,
-        createNodes,
-        createNodesV2,
+        eraseOptionsType(createNodes),
+        eraseOptionsType(createNodesV2),
         nxJson
       );
       for (const file of groupErroredConfigFiles) {
@@ -1700,10 +1732,12 @@ export async function inferOncePerOptionSet<T>(
         if (!group.migratedRoots.has(root)) {
           for (const targetName of group.targetNames) {
             if (projectConfig.targets?.[targetName]) {
-              if (!nonMigratedInferredTargetNames.has(root)) {
-                nonMigratedInferredTargetNames.set(root, new Set());
+              let targetNames = nonMigratedInferredTargetNames.get(root);
+              if (!targetNames) {
+                targetNames = new Set();
+                nonMigratedInferredTargetNames.set(root, targetNames);
               }
-              nonMigratedInferredTargetNames.get(root).add(targetName);
+              targetNames.add(targetName);
             }
           }
           continue;
@@ -1717,12 +1751,12 @@ export async function inferOncePerOptionSet<T>(
           // Store the FULL inferred (command-based) target. Residual
           // computation strips `command`/`options.cwd` at the point of use;
           // `baselineFinal` (the equivalence oracle) needs the full form.
-          if (!inferredByRoot.has(root)) {
-            inferredByRoot.set(root, new Map());
+          let inferredTargets = inferredByRoot.get(root);
+          if (!inferredTargets) {
+            inferredTargets = new Map();
+            inferredByRoot.set(root, inferredTargets);
           }
-          inferredByRoot
-            .get(root)
-            .set(targetName, structuredClone(inferredTarget));
+          inferredTargets.set(targetName, structuredClone(inferredTarget));
         }
       }
     }
@@ -2003,7 +2037,7 @@ async function runVerificationPass<T>(
    */
   erroredConfigFiles: string[];
 }> {
-  const nxJson = readNxJson(tree);
+  const nxJson = readRequiredNxJson(tree);
   const registrations = (nxJson.plugins ?? []).filter(
     (plugin): plugin is string | ExpandedPluginConfiguration =>
       plugin === pluginPath ||
@@ -2018,7 +2052,11 @@ async function runVerificationPass<T>(
     const plugins = registrations.map(
       (registration) =>
         new LoadedNxPlugin(
-          { createNodes, createNodesV2, name: pluginPath },
+          {
+            createNodes: eraseOptionsType(createNodes),
+            createNodesV2: eraseOptionsType(createNodesV2),
+            name: pluginPath,
+          },
           registration
         )
     );
@@ -2109,10 +2147,12 @@ async function verifyAndFallback<T>(
   for (const [projectName, targetMap] of residualByProject) {
     const root = projectGraph.nodes[projectName]?.data?.root;
     for (const targetName of targetMap.keys()) {
-      if (!migratedRootsByTarget.has(targetName)) {
-        migratedRootsByTarget.set(targetName, new Set());
+      let migratedRoots = migratedRootsByTarget.get(targetName);
+      if (!migratedRoots) {
+        migratedRoots = new Set();
+        migratedRootsByTarget.set(targetName, migratedRoots);
       }
-      migratedRootsByTarget.get(targetName).add(root);
+      migratedRoots.add(root);
     }
   }
 
@@ -2149,13 +2189,12 @@ async function verifyAndFallback<T>(
   }
 
   if (revertedTargets.size > 0) {
-    const nxJson = readNxJson(tree);
+    const nxJson = readRequiredNxJson(tree);
     for (const targetName of revertedTargets) {
-      removeHoistedTargetDefault(
-        nxJson,
-        targetName,
-        hoistedByTarget.get(targetName)
-      );
+      const hoisted = hoistedByTarget.get(targetName);
+      if (hoisted) {
+        removeHoistedTargetDefault(nxJson, targetName, hoisted);
+      }
     }
     updateNxJson(tree, nxJson);
     for (const [projectName, targetMap] of residualByProject) {
@@ -2379,8 +2418,8 @@ function stageDeferredPlan<T>(
 
   batchStaging.stagePlan({
     pluginPath,
-    createNodes,
-    createNodesV2,
+    createNodes: eraseOptionsType(createNodes),
+    createNodesV2: eraseOptionsType(createNodesV2),
     logger,
     pluginPreRegistered,
     residualByProject,
@@ -2407,8 +2446,8 @@ async function migrateProjects<T>(
   tree: Tree,
   projectGraph: ProjectGraph,
   pluginPath: string,
-  createNodes: CreateNodes<T>,
-  createNodesV2: CreateNodes<T>,
+  createNodes: CreateNodes<T> | undefined,
+  createNodesV2: CreateNodes<T> | undefined,
   defaultPluginOptions: T,
   migrations: MigrationDefinition<T>[],
   specificProjectToMigrate?: string,
@@ -2432,7 +2471,7 @@ async function migrateProjects<T>(
   const projectConfigsByName = getProjects(tree);
 
   // Phase 1: Infer (once per distinct option set) for the whole workspace.
-  const nxJson = readNxJson(tree);
+  const nxJson = readRequiredNxJson(tree);
   const {
     inferredTargetsByOptionSet,
     matchedConfigFiles,
@@ -2496,17 +2535,19 @@ async function migrateProjects<T>(
   // its final state first. The pre-registration state is captured here for the
   // hoist's dead-entry removal gate, which needs to know whether this
   // migration added the registration.
-  const pluginPreRegistered = (readNxJson(tree).plugins ?? []).some((plugin) =>
-    isRegistrationOfPlugin(plugin, pluginPath)
+  const pluginPreRegistered = (readRequiredNxJson(tree).plugins ?? []).some(
+    (plugin) => isRegistrationOfPlugin(plugin, pluginPath)
   );
   const migratedTargetNamesByProject = new Map<string, Set<string>>();
   for (const { targetAndProjects } of scope.executorScopes) {
     for (const [targetName, projectNames] of targetAndProjects) {
       for (const projectName of projectNames) {
-        if (!migratedTargetNamesByProject.has(projectName)) {
-          migratedTargetNamesByProject.set(projectName, new Set());
+        let targetNames = migratedTargetNamesByProject.get(projectName);
+        if (!targetNames) {
+          targetNames = new Set();
+          migratedTargetNamesByProject.set(projectName, targetNames);
         }
-        migratedTargetNamesByProject.get(projectName).add(targetName);
+        targetNames.add(targetName);
       }
     }
   }
@@ -2664,7 +2705,7 @@ function addPluginRegistrations<T>(
   executorTargetRoots: Set<string>,
   logger: typeof devkitLogger
 ) {
-  const nxJson = readNxJson(tree);
+  const nxJson = readRequiredNxJson(tree);
 
   // Config files owned by a NON-MIGRATED project keep the `include` scoped.
   // `matchedConfigFiles` only lists roots THIS pass inferred; a non-migrated
@@ -2744,10 +2785,12 @@ function addPluginRegistrations<T>(
     if (owner == null) {
       continue;
     }
-    if (!configFilesByOwner.has(owner)) {
-      configFilesByOwner.set(owner, []);
+    let ownerConfigFiles = configFilesByOwner.get(owner);
+    if (!ownerConfigFiles) {
+      ownerConfigFiles = [];
+      configFilesByOwner.set(owner, ownerConfigFiles);
     }
-    configFilesByOwner.get(owner).push(file);
+    ownerConfigFiles.push(file);
   }
   const takenOver = findTakenOverTargets(
     tree,
@@ -2785,10 +2828,12 @@ function addPluginRegistrations<T>(
         continue;
       }
       const root = entry.node.data.root;
-      if (!fenced.has(root)) {
-        fenced.set(root, []);
+      let fencedEntries = fenced.get(root);
+      if (!fencedEntries) {
+        fencedEntries = [];
+        fenced.set(root, fencedEntries);
       }
-      fenced.get(root).push(entry);
+      fencedEntries.push(entry);
     }
 
     const added = [...fenced.keys()].map((root) => ({
@@ -2836,16 +2881,17 @@ function addPluginRegistrations<T>(
     // reaches only files that should stay out, otherwise file by file.
     if (added.some(({ glob }) => glob.startsWith('!'))) {
       const touched = new Set([...fenced.keys(), ...roots]);
-      const untouched = rawMatchedConfigFiles.filter(
-        (file) => !touched.has(ownerOf(file))
-      );
+      const untouched = rawMatchedConfigFiles.filter((file) => {
+        const owner = ownerOf(file);
+        return owner == null || !touched.has(owner);
+      });
       const admittedBefore = new Set(
         findMatchingConfigFiles(untouched, [], kept)
       );
       const excludedBefore = new Set(
         untouched.filter((file) => !admittedBefore.has(file))
       );
-      const reopenedByOwner = new Map<string | undefined, string[]>();
+      const reopenedByOwner = new Map<ReturnType<typeof ownerOf>, string[]>();
       for (const file of findMatchingConfigFiles(untouched, [], exclude)) {
         if (excludedBefore.has(file)) {
           const owner = ownerOf(file);
@@ -2858,9 +2904,16 @@ function addPluginRegistrations<T>(
       for (const [owner, files] of reopenedByOwner) {
         const ownerGlob = owner == null ? null : rootIncludeGlob(owner);
         if (
+          owner != null &&
           ownerGlob &&
           findMatchingConfigFiles(rawMatchedConfigFiles, [ownerGlob], []).every(
-            (file) => excludedBefore.has(file) || fenced.has(ownerOf(file))
+            (file) => {
+              const fileOwner = ownerOf(file);
+              return (
+                excludedBefore.has(file) ||
+                (fileOwner != null && fenced.has(fileOwner))
+              );
+            }
           )
         ) {
           added.push({ root: owner, glob: ownerGlob });
@@ -2877,14 +2930,14 @@ function addPluginRegistrations<T>(
       delete registration.exclude;
     }
     for (const [root, entries] of fenced) {
-      for (const { node, targetName } of entries) {
+      for (const { node, targetName, target } of entries) {
         logger.warn(
           takenOverTargetWarning(
             pluginPath,
             node.name,
             root,
             targetName,
-            node.data.targets[targetName],
+            target,
             rootIncludeGlob(root),
             laterPluginRegistered
           )
@@ -2897,7 +2950,10 @@ function addPluginRegistrations<T>(
   // dropped while the exclude stays.
   const coverageOutside = (fencedRoots: Set<string>) =>
     fencedRoots.size > 0
-      ? coverageConfigFiles.filter((file) => !fencedRoots.has(ownerOf(file)))
+      ? coverageConfigFiles.filter((file) => {
+          const owner = ownerOf(file);
+          return owner == null || !fencedRoots.has(owner);
+        })
       : coverageConfigFiles;
 
   const registrationGroups = new Map<
@@ -2913,15 +2969,16 @@ function addPluginRegistrations<T>(
     const root = projectGraph.nodes[project].data.root;
     const projectIncludeGlob = rootIncludeGlob(root);
     const key = stableStringify(options);
-    if (!registrationGroups.has(key)) {
-      registrationGroups.set(key, {
+    let group = registrationGroups.get(key);
+    if (!group) {
+      group = {
         options,
         include: [],
         targetNames: new Set(),
         roots: [],
-      });
+      };
+      registrationGroups.set(key, group);
     }
-    const group = registrationGroups.get(key);
     group.include.push(projectIncludeGlob);
     group.roots.push(root);
     for (const targetName of migratedTargetNamesByProject.get(project) ?? []) {
@@ -2943,7 +3000,8 @@ function addPluginRegistrations<T>(
     spinner.updateText(
       `${index}/${registrationGroups.size} - Applying plugin configuration...`
     );
-    const existingPlugin = nxJson.plugins?.find(
+    const registeredPlugins = nxJson.plugins ?? [];
+    const existingPlugin = registeredPlugins.find(
       (plugin): plugin is ExpandedPluginConfiguration =>
         typeof plugin !== 'string' &&
         plugin.plugin === pluginPath &&
@@ -2983,21 +3041,24 @@ function addPluginRegistrations<T>(
         include: existingPlugin.include && [...existingPlugin.include],
         exclude: existingPlugin.exclude && [...existingPlugin.exclude],
       };
-      for (const projectIncludeGlob of existingPlugin.include ? include : []) {
-        if (
-          !existingPlugin.include.some((include) =>
-            minimatch(projectIncludeGlob, include, { dot: true })
-          )
-        ) {
-          existingPlugin.include.push(projectIncludeGlob);
+      const existingInclude = existingPlugin.include;
+      if (existingInclude) {
+        for (const projectIncludeGlob of include) {
+          if (
+            !existingInclude.some((include) =>
+              minimatch(projectIncludeGlob, include, { dot: true })
+            )
+          ) {
+            existingInclude.push(projectIncludeGlob);
+          }
         }
       }
-      const position = nxJson.plugins.indexOf(existingPlugin);
+      const position = registeredPlugins.indexOf(existingPlugin);
       const fencedRoots = fenceRegistration(
         existingPlugin,
         before,
         group,
-        nxJson.plugins
+        registeredPlugins
           .slice(position + 1)
           .some((plugin) => !isRegistrationOfPlugin(plugin, pluginPath))
       );
@@ -3019,6 +3080,16 @@ function addPluginRegistrations<T>(
   spinner.updateText(`Migrations done`);
 
   updateNxJson(tree, nxJson);
+}
+
+/**
+ * `LoadedNxPlugin` types plugin options as `unknown`, but a plugin only ever
+ * receives the options of its own registrations.
+ */
+function eraseOptionsType<T>(
+  createNodes: CreateNodes<T> | undefined
+): CreateNodes | undefined {
+  return createNodes as CreateNodes | undefined;
 }
 
 function rootIncludeGlob(root: string): string {
@@ -3045,6 +3116,7 @@ function rootDepth(root: string): number {
 interface TakenOverTarget {
   node: ProjectGraphProjectNode;
   targetName: string;
+  target: TargetConfiguration;
   /** The plugin's matched config files whose closest project root is the node's. */
   configFiles: string[];
 }
@@ -3070,8 +3142,9 @@ function findTakenOverTargets(
       continue;
     }
     for (const targetName of targetNames) {
+      const target = node.data.targets?.[targetName];
       if (
-        node.data.targets?.[targetName] &&
+        target &&
         !treeAuthorsTargetIdentity(
           tree,
           projectConfigsByName.get(node.name),
@@ -3079,7 +3152,7 @@ function findTakenOverTargets(
           targetName
         )
       ) {
-        takenOver.push({ node, targetName, configFiles });
+        takenOver.push({ node, targetName, target, configFiles });
       }
     }
   }
@@ -3117,8 +3190,9 @@ function rootsWithExecutorTarget(
   const roots = new Set<string>();
   for (const project of projectConfigsByName.values()) {
     if (
-      Object.values(project.targets ?? {}).some((target) =>
-        executors.has(target.executor)
+      Object.values(project.targets ?? {}).some(
+        (target) =>
+          target.executor !== undefined && executors.has(target.executor)
       )
     ) {
       roots.add(project.root);
@@ -3212,9 +3286,10 @@ function dropUninferredTargets<T>(
       for (const projectName of projectNames) {
         const optionSetId = executorScope.inferenceOptionSetIds
           .get(targetName)
-          .get(projectName);
+          ?.get(projectName);
         const root = projectGraph.nodes[projectName].data.root;
         if (
+          optionSetId !== undefined &&
           inferredTargetsByOptionSet
             .get(optionSetId)
             ?.get(root)
