@@ -198,6 +198,7 @@ export type { JsonInput } from './native';
 export {
   isAiAgent,
   killProcessTreeGraceful,
+  matchPluginFiles,
   readShebangHeaders,
   unmatchedProjectPatterns,
 } from './native';
