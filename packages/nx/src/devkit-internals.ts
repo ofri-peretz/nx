@@ -100,11 +100,14 @@ export {
 } from './plugins/js/utils/typescript-backend';
 export type { ApiTypescriptBackend } from './plugins/js/utils/typescript-backend';
 export {
+  addSyntheticLeadingComment,
   flattenApiDiagnosticMessage,
   getSyntaxErrors,
   getTypescriptAst,
   hasParseErrors,
+  printList,
   printNode,
+  printNodeUpdate,
   withSourceFileChecker,
 } from './plugins/js/utils/typescript-ast';
 export type {
