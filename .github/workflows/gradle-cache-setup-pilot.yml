@@ -1,0 +1,96 @@
+name: Gradle cache setup pilot
+
+on:
+  push:
+    branches:
+      - test/gradle-cache-setup-pilot-20261123
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install the nightly Java toolchains
+        uses: jdx/mise-action@146a28175021df8ca24f8ee1828cc2a60f980bd5 # v3
+        with:
+          install_args: java
+          cache: 'false'
+
+      - name: Check runner and pre-existing Gradle state
+        shell: bash
+        run: |
+          uname -sm
+          java -version
+          if [[ -d "${GRADLE_USER_HOME:-$HOME/.gradle}/caches" ]]; then
+            echo "Gradle caches were present before restore."
+          fi
+
+      - name: Restore Gradle cache read-only
+        uses: gradle/actions/setup-gradle@48b5f213c81028ace310571dc5ec0fbbca0b2947 # v4.4.3
+        with:
+          cache-read-only: true
+
+      - name: Compare Gradle graph setup
+        shell: bash
+        run: |
+          set -u
+          restored_home="${GRADLE_USER_HOME:-$HOME/.gradle}"
+          cold_home=$(mktemp -d "$RUNNER_TEMP/gradle-cold.XXXXXX")
+          offline_home="$RUNNER_TEMP/gradle-offline"
+          root_commit=$(git rev-parse HEAD)
+
+          graph() {
+            local name="$1" gradle_home="$2" status=0 started tree
+            shift 2
+            tree="$RUNNER_TEMP/gradle-workspace-$name"
+            git worktree add -q --detach "$tree" "$root_commit"
+            started=$(date +%s%3N)
+            (
+              cd "$tree"
+              export GRADLE_USER_HOME="$gradle_home"
+              timeout -k 15s 5m ./gradlew nxProjectGraph -Phash="gradle-pilot-$GITHUB_RUN_ID" \
+                --no-configuration-cache --parallel --build-cache --warning-mode none \
+                "-PworkspaceRoot=$tree" --no-daemon --console=plain "$@"
+            ) || status=$?
+            printf '%s graph: exit %d, %d ms\n' "$name" "$status" "$(( $(date +%s%3N) - started ))" |
+              tee -a "$GITHUB_STEP_SUMMARY"
+            if [[ "$status" == 0 ]]; then
+              test -s "$tree/build/nx/nx-root-project.json"
+              test -s "$tree/packages/gradle/project-graph/build/nx/gradle-project-graph.json"
+              test -s "$tree/packages/gradle/batch-runner/build/nx/gradle-batch-runner.json"
+              echo "$name graph: all three reports present" | tee -a "$GITHUB_STEP_SUMMARY"
+            fi
+          }
+
+          if [[ -d "$restored_home/caches/modules-2" ]]; then
+            du -sm "$restored_home"
+            for artifact in kotlin-gradle-plugin kotlin-gradle-plugins-bom; do
+              artifact_dir="$restored_home/caches/modules-2/files-2.1/org.jetbrains.kotlin/$artifact/2.2.10"
+              if [[ -d "$artifact_dir" ]]; then
+                find "$artifact_dir" -type f -printf '%f\n' | sort
+              else
+                echo "$artifact 2.2.10 absent before Gradle ran" | tee -a "$GITHUB_STEP_SUMMARY"
+              fi
+            done
+            cp -a --reflink=auto "$restored_home" "$offline_home"
+            graph cold-online "$cold_home"
+            graph restored-online "$restored_home"
+            shopt -s nullglob
+            wrappers=("$offline_home"/wrapper/dists/gradle-8.14.3-bin/*/gradle-8.14.3/bin/gradle)
+            if [[ ${#wrappers[@]} -gt 0 && -x "${wrappers[0]}" &&
+                  -f "${wrappers[0]%/gradle-8.14.3/bin/gradle}/gradle-8.14.3-bin.zip.ok" ]]; then
+              graph restored-offline "$offline_home" --offline
+            else
+              echo "Restored wrapper missing. Offline graph skipped." | tee -a "$GITHUB_STEP_SUMMARY"
+            fi
+          else
+            echo "Gradle dependency cache missing after restore." | tee -a "$GITHUB_STEP_SUMMARY"
+            graph cold-online "$cold_home"
+          fi
