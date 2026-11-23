@@ -1072,7 +1072,9 @@ function getInputs(
   const normalizeInput = (
     input: string,
     config: ParsedTsconfigData,
-    baseDir = absoluteProjectRoot
+    baseDir = absoluteProjectRoot,
+    // One glob over every extension instead of a glob per extension.
+    singleGlob = false
   ): string[] => {
     const extensions = config.options.allowJs
       ? [...allSupportedExtensions]
@@ -1083,6 +1085,13 @@ function getInputs(
 
     // An "includes" path "foo" is implicitly a glob "foo/**/*"
     if (isImplicitGlobSpec(input, baseDir)) {
+      if (singleGlob) {
+        // `*.ts` already matches `*.d.ts`, and the same for `.cts` and `.mts`.
+        const suffixes = extensions
+          .map((ext) => ext.slice(1))
+          .filter((ext) => !ext.startsWith('d.'));
+        return [`${input}/**/*.{${suffixes.join(',')}}`];
+      }
       return extensions.map((ext) => `${input}/**/*${ext}`);
     }
 
@@ -1289,7 +1298,7 @@ function getInputs(
       const include: string[] =
         refTsConfig.raw?.include ?? (refTsConfig.raw?.files ? [] : ['.']);
       for (const spec of [...include, ...(refTsConfig.raw?.files ?? [])]) {
-        for (const input of normalizeInput(spec, refTsConfig, refDir)) {
+        for (const input of normalizeInput(spec, refTsConfig, refDir, true)) {
           sourceInputs.add(toInput(input));
         }
       }
