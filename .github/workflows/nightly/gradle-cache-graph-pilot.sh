@@ -67,6 +67,19 @@ graph() {
 
 graph online "$probe_dir/gradle-home" normal
 GRADLE_USER_HOME="$probe_dir/gradle-home" ./.gradlew-cache-pilot --stop
+for daemon_log in "$probe_dir/gradle-home"/daemon/*/daemon-*.out.log; do
+  [[ -f "$daemon_log" ]] || continue
+  daemon_pid=${daemon_log##*/daemon-}
+  daemon_pid=${daemon_pid%.out.log}
+  deadline=$((SECONDS + 15))
+  while daemon_state=$(ps -o stat= -p "$daemon_pid") && [[ "$daemon_state" != Z* ]]; do
+    if ((SECONDS >= deadline)); then
+      printf 'Gradle daemon %s did not exit before the cache snapshot.\n' "$daemon_pid" >&2
+      exit 1
+    fi
+    sleep 0.2
+  done
+done
 measure 'Pack dependency and wrapper caches' tar --zstd \
   --exclude='*.lock' --exclude='*.lck' --exclude=gc.properties \
   -C "$probe_dir/gradle-home" -cf "$probe_dir/gradle.tar.zst" caches/modules-2 wrapper/dists
