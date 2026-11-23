@@ -2,7 +2,7 @@
 set -euo pipefail
 
 probe_dir=$(mktemp -d "$RUNNER_TEMP/gradle-graph-parity.XXXXXX")
-mkdir -p "$probe_dir"/{empty-maven,seed,restored}
+mkdir -p "$probe_dir"/{empty-maven,gradle-home}
 export GRADLE_OPTS="-Dmaven.repo.local=$probe_dir/empty-maven"
 export NX_DAEMON=false NX_CACHE_PROJECT_GRAPH=false NX_NO_CLOUD=true
 export GRADLE_PROBE_ARGS="$probe_dir/gradle-args"
@@ -39,13 +39,17 @@ clear_gradle_outputs() {
     packages/gradle/project-graph/{.gradle,build/nx}
 }
 
+monotonic_ms() {
+  python3 -c 'import time; print(time.monotonic_ns() // 1_000_000)'
+}
+
 measure() {
   local label="$1"
   shift
   local start
-  start=$(date +%s%3N)
+  start=$(monotonic_ms)
   "$@"
-  echo "$label: $(( $(date +%s%3N) - start )) ms" | tee -a "$GITHUB_STEP_SUMMARY"
+  echo "$label: $(( $(monotonic_ms) - start )) ms" | tee -a "$GITHUB_STEP_SUMMARY"
 }
 
 graph() {
@@ -61,16 +65,18 @@ graph() {
   test -s "$probe_dir/$arm-nx/gradle-nodes.hash"
 }
 
-graph online "$probe_dir/seed" normal
-GRADLE_USER_HOME="$probe_dir/seed" ./.gradlew-cache-pilot --stop
+graph online "$probe_dir/gradle-home" normal
+GRADLE_USER_HOME="$probe_dir/gradle-home" ./.gradlew-cache-pilot --stop
 measure 'Pack dependency and wrapper caches' tar --zstd \
   --exclude='*.lock' --exclude='*.lck' --exclude=gc.properties \
-  -C "$probe_dir/seed" -cf "$probe_dir/gradle.tar.zst" caches/modules-2 wrapper/dists
+  -C "$probe_dir/gradle-home" -cf "$probe_dir/gradle.tar.zst" caches/modules-2 wrapper/dists
 wc -c "$probe_dir/gradle.tar.zst" | tee -a "$GITHUB_STEP_SUMMARY"
+mv "$probe_dir/gradle-home" "$probe_dir/online-gradle-home"
+mkdir "$probe_dir/gradle-home"
 measure 'Extract dependency and wrapper caches' tar --zstd \
-  -C "$probe_dir/restored" -xf "$probe_dir/gradle.tar.zst"
+  -C "$probe_dir/gradle-home" -xf "$probe_dir/gradle.tar.zst"
 
-graph restored "$probe_dir/restored" blocked
+graph restored "$probe_dir/gradle-home" blocked
 
 node - "$probe_dir" <<'COMPARE' | tee -a "$GITHUB_STEP_SUMMARY"
 const assert = require('node:assert/strict');
@@ -83,6 +89,38 @@ const edgeKey = ({ source, target, sourceFile = '', type = '' }) =>
   [source, target, sourceFile, type].join('\n');
 const sortedEdges = (edges) =>
   [...edges].sort((left, right) => edgeKey(left).localeCompare(edgeKey(right)));
+
+const compareJson = (left, right) =>
+  JSON.stringify(left).localeCompare(JSON.stringify(right));
+
+function normalizeGradleTargets(targets) {
+  return Object.fromEntries(
+    Object.entries(targets).map(([name, target]) => {
+      if (!name.startsWith('gradle:')) {
+        return [name, target];
+      }
+      const normalized = { ...target };
+      if (target.dependsOn) {
+        normalized.dependsOn = target.dependsOn
+          .map((dependency) =>
+            Array.isArray(dependency?.projects)
+              ? { ...dependency, projects: [...dependency.projects].sort() }
+              : dependency
+          )
+          .sort(compareJson);
+      }
+      if (target.inputs) {
+        const isDependencyOutput = (input) =>
+          input !== null && typeof input === 'object' && 'dependentTasksOutputFiles' in input;
+        const outputInputs = target.inputs.filter(isDependencyOutput).sort(compareJson);
+        normalized.inputs = target.inputs.map((input) =>
+          isDependencyOutput(input) ? outputInputs.shift() : input
+        );
+      }
+      return [name, normalized];
+    })
+  );
+}
 
 function readArm(arm) {
   const report = load(`${arm}-nx/gradle-nodes.hash`);
@@ -115,9 +153,20 @@ function readArm(arm) {
     report: {
       ...report,
       buildFiles: [...report.buildFiles].sort(),
-      dependencies: sortedEdges(report.dependencies)
+      dependencies: sortedEdges(report.dependencies),
+      nodes: Object.fromEntries(
+        Object.entries(report.nodes).map(([root, node]) => [
+          root,
+          { ...node, targets: normalizeGradleTargets(node.targets) }
+        ])
+      )
     },
-    graphNodes,
+    graphNodes: Object.fromEntries(
+      Object.entries(graphNodes).map(([name, node]) => [
+        name,
+        { ...node, data: { ...node.data, targets: normalizeGradleTargets(node.data.targets) } }
+      ])
+    ),
     graphDependencies: Object.fromEntries(
       Object.keys(graphNodes).map((name) => [name, sortedEdges(graph.dependencies[name] ?? [])])
     )
